@@ -2,6 +2,7 @@ from config import config, device
 from preproc import preproc
 from absl import app
 import math
+import time
 import os
 import numpy as np
 import json
@@ -17,6 +18,7 @@ import torch.cuda
 from torch.utils.data import Dataset
 from tensorboardX import SummaryWriter
 import pickle
+
 writer = SummaryWriter(log_dir='./log1')
 '''
 Some functions are from the official evaluation script.
@@ -25,6 +27,7 @@ Some functions are from the official evaluation script.
 class SQuADDataset(Dataset):
     def __init__(self, npz_file, batch_size):
         data = np.load(npz_file)
+        print(str(npz_file))
         self.context_idxs = data["context_idxs"]
         self.context_char_idxs = data["context_char_idxs"]
         self.ques_idxs = data["ques_idxs"]
@@ -158,10 +161,11 @@ def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
     return max(scores_for_ground_truths)
 
 
-def train(model, optimizer, scheduler, dataset, dev_dataset, dev_eval_file, start, ema):
+def train(model, optimizer, scheduler,scheduler_2, dataset, dev_dataset, dev_eval_file, start, ema):
     model.train()
     losses = []
     print(f'Training epoch {start}')
+
     for i, (Cwid, Ccid, Qwid, Qcid, y1, y2, ids) in enumerate(dataset):
         optimizer.zero_grad()
         Cwid, Ccid, Qwid, Qcid = Cwid.to(device), Ccid.to(device), Qwid.to(device), Qcid.to(device)
@@ -183,7 +187,7 @@ def train(model, optimizer, scheduler, dataset, dev_dataset, dev_eval_file, star
         scheduler.step()
         if (i+1) % config.checkpoint == 0 and (i+1) < config.checkpoint*(len(dataset)//config.checkpoint):
             ema.assign(model)
-            metrics = test(model, dev_dataset, dev_eval_file, i+start*len(dataset))
+            metrics = test(model, dev_dataset, dev_eval_file, i+start*len(dataset), scheduler_2)
             ema.resume(model)
             model.train()
         for param_group in optimizer.param_groups:
@@ -193,7 +197,7 @@ def train(model, optimizer, scheduler, dataset, dev_dataset, dev_eval_file, star
     loss_avg = np.mean(losses)
     print("STEP {:8d} Avg_loss {:8f}\n".format(start, loss_avg))
 
-def test(model, dataset, eval_file, test_i):
+def test(model, dataset, eval_file, test_i, scheduler_2):
     print("\nTest")
     model.eval()
     answer_dict = {}
@@ -238,6 +242,7 @@ def test(model, dataset, eval_file, test_i):
     json.dump(answer_dict, f)
     f.close()
     metrics["loss"] = loss
+    scheduler_2.step(metrics['loss'])
     print("EVAL loss {:8f} F1 {:8f} EM {:8f}\n".format(loss, metrics["f1"], metrics["exact_match"]))
     if config.mode == "train":
         writer.add_scalar('data/test_loss', loss, test_i)
@@ -277,14 +282,15 @@ def train_entry(config):
     scheduler = optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lambda ee: cr * math.log2(ee + 1) if ee < lr_warm_up_num else lr)
+    scheduler_2 = optim.lr_scheduler.ReduceLROnPlateau(optimizer,'min', patience=1)
     best_f1 = 0
     best_em = 0
     patience = 0
     unused = False
     for iter in range(config.num_epoch):
-        train(model, optimizer, scheduler, train_dataset, dev_dataset, dev_eval_file, iter, ema)
+        train(model, optimizer, scheduler,scheduler_2, train_dataset, dev_dataset, dev_eval_file, iter, ema)
         ema.assign(model)
-        metrics = test(model, dev_dataset, dev_eval_file, (iter+1)*len(train_dataset))
+        metrics = test(model, dev_dataset, dev_eval_file, (iter+1)*len(train_dataset),scheduler_2)
         dev_f1 = metrics["f1"]
         dev_em = metrics["exact_match"]
         if dev_f1 < best_f1 and dev_em < best_em:
@@ -307,7 +313,7 @@ def test_entry(config):
     dev_dataset = get_loader(config.dev_record_file, config.batch_size)
     fn = os.path.join(config.save_dir, "model.pt")
     model = torch.load(fn)
-    test(model, dev_dataset, dev_eval_file, 0)
+    test(model, dev_dataset, dev_eval_file, 0,scheduler_2)
 
 
 def main(_):

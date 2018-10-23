@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from config import config
+import numpy as np
+from config import config, device
 
 D = config.connector_dim
 Nh = config.num_heads
@@ -15,6 +16,17 @@ dropout_char = config.dropout_char
 Lc = config.para_limit
 Lq = config.ques_limit
 
+
+def arccosh(x):
+    # log(x + sqrt(x^2 -1)
+    # log(x (1 + sqrt(x^2 -1)/x))
+    # log(x) + log(1 + sqrt(x^2 -1)/x)
+    # log(x) + log(1 + sqrt((x^2 -1)/x^2))
+    # log(x) + log(1 + sqrt(1 - x^-2))
+    x = x + 1e-6
+    c0 = torch.log(x)
+    c1 = torch.log1p(torch.sqrt(x * x - 1) / x)
+    return c0 + c1
 
 def mask_logits(inputs, mask):
     mask = mask.type(torch.float32)
@@ -76,7 +88,7 @@ class Highway(nn.Module):
     def forward(self, x):
         #x: shape [batch_size, hidden_size, length]
         for i in range(self.n):
-            gate = F.sigmoid(self.gate[i](x))
+            gate = torch.sigmoid(self.gate[i](x))
             nonlinear = self.linear[i](x)
             nonlinear = F.dropout(nonlinear, p=dropout, training=self.training)
             x = gate * nonlinear + (1 - gate) * x
@@ -89,10 +101,15 @@ class SelfAttention(nn.Module):
         super().__init__()
         self.mem_conv = Initialized_Conv1d(D, D*2, kernel_size=1, relu=False, bias=False)
         self.query_conv = Initialized_Conv1d(D, D, kernel_size=1, relu=False, bias=False)
-
+        self.att_conv = Initialized_Conv1d(400, 400, kernel_size=1, relu=False, bias=False)
         bias = torch.empty(1)
+        beta = torch.empty(1)
+        self.norm_01 = nn.LayerNorm(D//Nh)
+        self.norm_0 = nn.LayerNorm(D//Nh +1)
+        self.norm_00 = nn.LayerNorm(D//Nh +1)
         nn.init.constant_(bias, 0)
         self.bias = nn.Parameter(bias)
+        self.beta = nn.Parameter(beta)
 
     def forward(self, queries, mask):
         memory = queries
@@ -106,8 +123,81 @@ class SelfAttention(nn.Module):
 
         key_depth_per_head = D // Nh
         Q *= key_depth_per_head**-0.5
-        x = self.dot_product_attention(Q, K, V, mask = mask)
+        # x = self.dot_product_attention(Q, K, V, mask = mask)
+        x = self.hyperbolic_attention(Q, K, V, mask = mask)
         return self.combine_last_two_dim(x.permute(0,2,1,3)).transpose(1, 2)
+
+    def proj_hyperboloide(self,q):
+
+        q_norm = q.norm(dim=-1)
+
+        # if (q_norm.detach() ==  float('inf')).any():
+        #     print('norme infinie')
+        # if np.isnan(q_norm.detach()).any():
+        #     print('norme nan')
+
+        # q_normalized = (q.transpose(-2,-1) / q_norm.unsqueeze(-2)).transpose(-2,-1)
+        q_normalized = F.normalize(q, dim=-1)
+        # if (q_normalized.detach() ==  float('inf')).any():
+        #     print('q_normalized infini')
+        cosh_q = torch.cosh(q_norm)
+        # if (cosh_q.detach() ==  float('inf')).any():
+        #     print('cosh_q infini')
+        sinh_q = torch.sinh(q_norm)
+        # if (sinh_q.detach() ==  float('inf')).any():
+        #     print('sinh_q infini')
+        abs_q = (q_normalized.transpose(-2,-1)*sinh_q.unsqueeze(-2))
+        q_hyper = torch.cat((abs_q,cosh_q.unsqueeze(-2)), dim=-2).transpose(-2,-1)
+        return q_hyper
+
+    def proj_klein(self,q):
+        q_hyper_ = self.proj_hyperboloide(q)
+        q_klein_ =(q_hyper_.transpose(-2,-1)/q_hyper_[...,q.size(-1)].unsqueeze(-2)).transpose(-2,-1).narrow(-1,0,q.size(-1))
+        # if (q_klein_.detach() ==  float('inf')).any():
+        #     print('q_klein_ infini')
+        # if np.isnan(q_klein_.detach()).any():
+        #     print('nan q_klein_')
+        return F.normalize(q_klein_, dim=-1)
+
+    def hyperbolic_scalar_product(self,q_hyper,c_hyper,input_size):
+        q_n1 = q_hyper[...,input_size]
+        q_n = q_hyper[...,:input_size]
+        c_n1 = c_hyper[...,input_size]
+        c_n = c_hyper[...,:input_size]
+        c_nq_n = torch.matmul(c_n,q_n.transpose(-2,-1))
+        c_n1_q_n1 = torch.matmul(c_n1.unsqueeze(-1), q_n1.unsqueeze(-1).transpose(-2,-1))
+        diag = torch.diag(torch.ones(q_hyper.size(-2))).unsqueeze(0).unsqueeze(0)
+        ones = torch.zeros_like(c_nq_n)
+        mask = ones.cuda()+diag.cuda()
+        mask = mask.byte()
+        out = c_nq_n - c_n1_q_n1
+        if (q_hyper.detach() == c_hyper.detach()).all() :
+            out = out.masked_fill_(mask, -1.)
+        return out
+
+    def hyperbolic_distance(self,q_hyper,c_hyper,input_size):
+        # print((-self.hyperbolic_scalar_product(q_hyper,c_hyper,input_size)).size())
+
+        return arccosh(-self.hyperbolic_scalar_product(q_hyper,c_hyper,input_size))
+
+    def Lorentz_denominator(self,v_klein, eps = 1e-4):
+        norm = (v_klein.norm(dim=-1) - eps) **2
+        if (norm.detach() >= 1.).any():
+            print('problem')
+            print(norm.detach().max())
+        # if np.isnan(norm.detach()).any():
+        #     print('Lorentz norm ',norm)
+        denom = torch.sqrt(1-norm) + eps
+
+        tensor_ = torch.zeros_like(denom) + 1
+        return (tensor_/denom).unsqueeze(-2)
+
+    def attention_module(self,c,q,v, input_size):
+        c_hyper = self.proj_hyperboloide(c)
+        q_hyper = self.proj_hyperboloide(q)
+        v_klein = self.proj_klein(v)
+        alpha = F.softmax(self.hyperbolic_distance(q_hyper,c_hyper,input_size)*self.Lorentz_denominator(v_klein), dim=-1)
+        return torch.matmul(alpha,v_klein)
 
     def dot_product_attention(self, q, k ,v, bias = False, mask = None):
         """dot-product attention.
@@ -132,6 +222,70 @@ class SelfAttention(nn.Module):
         # dropping out the attention links for each of the heads
         weights = F.dropout(weights, p=dropout, training=self.training)
         return torch.matmul(weights, v)
+
+    def hyperbolic_attention(self, q, k ,v, bias = True, mask = None):
+        """dot-product attention.
+        Args:
+        q: a Tensor with shape [batch, heads, length_q, depth_k]
+        k: a Tensor with shape [batch, heads, length_kv, depth_k]
+        v: a Tensor with shape [batch, heads, length_kv, depth_v]
+        bias: bias Tensor (see attention_bias())
+        is_training: a bool of training
+        scope: an optional string
+        Returns:
+        A Tensor.
+        """
+        input_size = q.size(-1)
+
+        q_hyper = self.proj_hyperboloide(q)
+        k_hyper = self.proj_hyperboloide(k)
+        v_klein = self.proj_klein(v)
+        hyperbolic_distance = self.hyperbolic_distance(q_hyper,k_hyper,input_size)
+        # Version one :  attention weights are symetric but dont use einstein midpoint
+        #logits = hyperbolic_distance*self.Lorentz_denominator(v_klein)
+        logits = self.beta*hyperbolic_distance
+        logits = -logits + torch.log(self.Lorentz_denominator(v_klein))
+        # alphas_klein = alphas*self.Lorentz_denominator(v_klein)
+
+        # logits = hyperbolic_distance*self.Lorentz_denominator(v_klein)
+
+        # print("logits",logits.size())
+        # logits = torch.matmul(q,k.permute(0,1,3,2))
+        if bias:
+            logits += self.bias
+        if mask is not None:
+            shapes = [x  if x != None else -1 for x in list(logits.size())]
+            mask = mask.view(shapes[0], 1, 1, shapes[-1])
+            logits = mask_logits(logits, mask)
+        #Version1
+        weights = F.softmax(logits, dim=-1)
+        # logits = torch.exp(-logits)
+        # numerator = logits*Lorentz_denominator(v_klein)
+        # denominator = torch.matmul(logits, Lorentz_denominator(v_klein).transpose(-1,-2))
+        # weights = (numerator/denominator)
+        weights = F.dropout(weights, p=dropout, training=self.training)
+        # if (weights.detach() == torch.float('inf')).any():
+        #     print('weights infini')
+
+
+        # print('return ', torch.matmul(weights, v_klein).size())
+        # dropping out the attention links for each of the heads
+        # weights = F.dropout(weights, p=dropout, training=self.training)
+        if np.isnan(torch.matmul(weights, v_klein).detach()).any():
+            print('max ', logits.max(dim=-1), logits.min(dim=-1))
+            print('q_hyper ',q_hyper.size(),q_hyper.max(dim=-1),np.isnan(q_hyper.detach()).any())
+            print('k_hyper ',k_hyper.size(),k_hyper.max(dim=-1),np.isnan(k_hyper.detach()).any())
+            print('hyperbolic_distance ',hyperbolic_distance.size(),hyperbolic_distance.max(dim=-1),np.isnan(hyperbolic_distance.detach()).any())
+            print('v_klein',v_klein.size(),v_klein,np.isnan(v_klein.detach()).any())
+            print('self.Lorentz_denominator(v_klein)',self.Lorentz_denominator(v_klein).size(),self.Lorentz_denominator(v_klein).max(dim=-1),np.isnan(hyperbolic_distance.detach()).any())
+            print('logits ',logits.size(),logits,np.isnan(logits.detach()).any())
+            print('weights ',weights.size(),weights)
+            print('attention',torch.matmul(weights, v_klein).size(),torch.matmul(weights, v_klein).detach())
+        return torch.matmul(weights, v_klein)
+
+
+
+
 
     def split_last_dim(self, x, n):
         """Reshape x so that the last dimension becomes two dimensions.
